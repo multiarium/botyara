@@ -1,0 +1,83 @@
+# ================== НАСТРОЙКИ БОТА-ПЕРЕКУПА ==================
+
+telegram:
+  # Токен от @BotFather (в Telegram: /newbot). ВСТАВЬ СВОЙ:
+  token: "ехала"
+  # chat_id подставится автоматически после команды /start в боте.
+  # Можно вписать вручную (узнать: @userinfobot):
+  chat_id: 0
+
+settings:
+  check_interval_minutes: 7      # как часто сканировать (не ставь меньше 5 — бан)
+  min_margin_percent: 25         # минимальная маржа для уведомления
+  max_risk_score: 6              # макс. допустимый риск (0-10)
+  delivery_cost: 500             # средняя стоимость доставки, ₽
+  resale_discount_percent: 7     # скидка от рынка при перепродаже (торг)
+  platform_fee_percent: 2        # комиссия площадки при продаже
+  min_market_samples: 6          # минимум похожих лотов для оценки рынка
+
+# Город поиска. 637640 = вся Россия, 621540 = Москва, 621490 = Санкт-Петербург.
+# id своего города: avito.ru → выбери город → цифра в URL
+# (например avito.ru/kazan = 641560).
+location_id: 637640
+
+# ================== ФИЛЬТРЫ ПОИСКА ==================
+# max_price — потолок цены покупки. Добавляй/убирай свои.
+# category_id: 84 = телефоны, 98 = ноутбуки, 97 = приставки (можно не указывать).
+filters:
+  - name: "iPhone 13"
+    platform: avito
+    query: "iphone 13"
+    category_id: 84
+    max_price: 42000
+    enabled: true
+
+  - name: "iPhone 14"
+    platform: avito
+    query: "iphone 14"
+    category_id: 84
+    max_price: 55000
+    enabled: false
+
+  - name: "Samsung S23"
+    platform: avito
+    query: "samsung galaxy s23"
+    category_id: 84
+    max_price: 40000
+    enabled: false
+
+  - name: "MacBook Air M1"
+    platform: avito
+    query: "macbook air m1"
+    category_id: 98
+    max_price: 55000
+    enabled: false
+
+  - name: "MacBook Pro 14"
+    platform: avito
+    query: "macbook pro 14"
+    category_id: 98
+    max_price: 110000
+    enabled: false
+
+  - name: "PlayStation 5"
+    platform: avito
+    query: "playstation 5"
+    category_id: 97
+    max_price: 38000
+    enabled: false
+
+  - name: "Nintendo Switch OLED"
+    platform: avito
+    query: "nintendo switch oled"
+    category_id: 97
+    max_price: 22000
+    enabled: false
+
+  # Пример выключенного фильтра под Юлу (этап 2):
+  # - name: "iPhone 13 (Юла)"
+  #   platform: youla
+  #   query: "iphone 13"
+    category_id: 84
+  #   max_price: 42000
+  #   enabled: false
