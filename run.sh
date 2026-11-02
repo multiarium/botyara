@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 termux-wake-lock 2>/dev/null
 while true; do
   echo "[$(date)] Запуск бота..."
-  python bot.py
+  .venv/bin/python bot.py
   echo "[$(date)] Бот упал, перезапуск через 10 сек..."
   sleep 10
 done

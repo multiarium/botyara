@@ -7,6 +7,8 @@
 import re
 import asyncio
 import random
+import time
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -29,6 +31,23 @@ def _parse_price(raw: str) -> int:
     """'40\xa0990\xa0₽' -> 40990"""
     digits = re.sub(r"[^\d]", "", raw or "")
     return int(digits) if digits else 0
+
+
+def _parse_retry_after(value: str | None) -> int | None:
+    """Разбирает Retry-After: секунды или HTTP-дату."""
+    if not value:
+        return None
+
+    try:
+        return max(0, int(value.strip()))
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        target = parsedate_to_datetime(value)
+        return max(0, int(target.timestamp() - time.time()))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _best_image(gallery: list) -> str | None:
@@ -69,10 +88,19 @@ async def fetch_listings(query: str, *, location_id: int | None = None,
     except httpx.HTTPError as e:
         raise ParserError(f"Авито: сетевая ошибка: {e}") from e
 
-    if resp.status_code == 429:
-        raise ParserError("Авито: 429 (слишком много запросов — нас временно ограничили)")
+    if resp.status_code in (403, 429, 439):
+        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+        raise ParserError(
+            f"Авито: HTTP {resp.status_code} — доступ временно ограничен",
+            status_code=resp.status_code,
+            retry_after=retry_after,
+        )
+
     if resp.status_code != 200:
-        raise ParserError(f"Авито: HTTP {resp.status_code}")
+        raise ParserError(
+            f"Авито: HTTP {resp.status_code}",
+            status_code=resp.status_code,
+        )
 
     try:
         data = resp.json()

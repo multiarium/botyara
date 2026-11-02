@@ -71,3 +71,43 @@ def cleanup(days: int = 14):
     cutoff = int(time.time()) - days * 86400
     with _conn() as c:
         c.execute("DELETE FROM seen WHERE created_at < ? AND decision IS NULL", (cutoff,))
+
+
+# Постоянная защита от ограничений источника.
+# Состояние хранится в SQLite и переживает перезапуск бота.
+
+def get_scan_block() -> tuple[int, str]:
+    raw_until = get_setting("source_blocked_until")
+    reason = get_setting("source_block_reason") or ""
+
+    try:
+        until = int(raw_until or 0)
+    except (TypeError, ValueError):
+        until = 0
+
+    return until, reason
+
+
+def set_scan_block(until: int, reason: str):
+    set_setting("source_blocked_until", str(int(until)))
+    set_setting("source_block_reason", reason)
+
+
+def clear_scan_block():
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM settings WHERE key IN (?, ?, ?)",
+            (
+                "source_blocked_until",
+                "source_block_reason",
+                "source_block_notified",
+            ),
+        )
+
+
+def scan_block_notified() -> bool:
+    return get_setting("source_block_notified") == "1"
+
+
+def mark_scan_block_notified():
+    set_setting("source_block_notified", "1")

@@ -10,11 +10,12 @@ import time
 from pathlib import Path
 
 import yaml
+import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 import db
@@ -68,18 +69,39 @@ def fmt_money(n: int | float) -> str:
 # ============================== СКАНЕР ==============================
 
 async def scan_once() -> dict:
-    """Один цикл: все фильтры → новые лоты → анализ → уведомления."""
+    """Один цикл поиска с постоянной защитой от HTTP-ограничений."""
     global CFG
-    CFG = load_config()  # подхватываем правки конфига на лету
-    summary = {"scanned": 0, "new": 0, "sent": 0, "errors": []}
+    CFG = load_config()
+
+    summary = {
+        "scanned": 0,
+        "new": 0,
+        "sent": 0,
+        "errors": [],
+    }
+
+    # Проверяем блокировку до любого сетевого обращения.
+    blocked_until, blocked_reason = db.get_scan_block()
+
+    if blocked_until > int(time.time()):
+        summary["blocked_until"] = blocked_until
+        summary["blocked_reason"] = blocked_reason
+        return summary
+
+    # Срок старой блокировки закончился.
+    if blocked_until:
+        db.clear_scan_block()
 
     for flt in CFG.get("filters", []):
         if not flt.get("enabled", True):
             continue
+
         platform = flt.get("platform", "avito")
         parser = PARSERS.get(platform)
+
         if not parser:
             continue
+
         try:
             listings = await parser.fetch_listings(
                 flt["query"],
@@ -87,39 +109,124 @@ async def scan_once() -> dict:
                 category_id=flt.get("category_id"),
                 count=30,
             )
+
             STATE["errors"][platform] = 0
             STATE["alerted"][platform] = False
+
         except ParserError as e:
-            STATE["errors"][platform] = STATE["errors"].get(platform, 0) + 1
+            STATE["errors"][platform] = (
+                STATE["errors"].get(platform, 0) + 1
+            )
             summary["errors"].append(str(e))
-            log.warning("%s (подряд: %s)", e, STATE["errors"][platform])
+
+            log.warning(
+                "%s (подряд: %s)",
+                e,
+                STATE["errors"][platform],
+            )
+
+            # При ограничении останавливаем ВЕСЬ цикл.
+            if e.status_code in (403, 429, 439):
+                retry_after = e.retry_after
+
+                if retry_after is None:
+                    try:
+                        minutes = int(
+                            CFG.get("settings", {}).get(
+                                "blocked_cooldown_minutes", 1440
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        minutes = 1440
+
+                    cooldown = max(60, minutes * 60)
+                else:
+                    cooldown = max(1, int(retry_after))
+
+                until = int(time.time()) + cooldown
+                reason = str(e)
+
+                db.set_scan_block(until, reason)
+
+                summary["blocked_until"] = until
+                summary["blocked_reason"] = reason
+
+                log.error(
+                    "Сканирование остановлено до %s UTC: %s",
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(until)),
+                    reason,
+                )
+
+                # Отправляем одно уведомление, а не повторяем его.
+                if not db.scan_block_notified():
+                    db.mark_scan_block_notified()
+                    cid = allowed_chat_id()
+
+                    if cid:
+                        message = (
+                            "⛔ <b>Авито ограничило доступ</b>\n\n"
+                            f"Причина: {html.escape(reason)}\n"
+                            "Сканирование всех фильтров остановлено.\n"
+                            f"Следующая проверка не раньше: "
+                            f"{time.strftime('%d.%m.%Y %H:%M:%S', time.gmtime(until))} UTC.\n\n"
+                            "Перезапуск бота и команда /test не отменяют эту паузу."
+                        )
+                        try:
+                            await bot.send_message(cid, message)
+                        except Exception as notify_error:
+                            log.warning(
+                                "Не удалось отправить уведомление о блокировке: %s",
+                                notify_error,
+                            )
+
+                return summary
+
             await maybe_alert_parser_down(platform, str(e))
             continue
 
         summary["scanned"] += len(listings)
+
+        # Рыночная выборка строится по всем полученным объявлениям.
         scan_prices = [(l.price, l.title) for l in listings]
         max_price = flt.get("max_price")
 
-        for l in listings:
-            l.filter_name = flt["name"]
-            if db.is_seen(l.uid):
+        for listing in listings:
+            listing.filter_name = flt["name"]
+
+            if db.is_seen(listing.uid):
                 continue
-            if max_price and l.price > max_price:
+
+            if max_price and listing.price > max_price:
                 continue
-            v = analyze(l, scan_prices, CFG)
-            db.save_seen(l.uid, platform, flt["name"], l.title, l.price,
-                         v.market_price, v.margin_pct, v.risk, v.profit,
-                         l.url, notified=int(v.worth_it))
+
+            verdict = analyze(listing, scan_prices, CFG)
+
+            db.save_seen(
+                listing.uid,
+                platform,
+                flt["name"],
+                listing.title,
+                listing.price,
+                verdict.market_price,
+                verdict.margin_pct,
+                verdict.risk,
+                verdict.profit,
+                listing.url,
+                notified=int(verdict.worth_it),
+            )
+
             summary["new"] += 1
-            if v.worth_it:
-                await notify_deal(v)
+
+            if verdict.worth_it:
+                await notify_deal(verdict)
                 summary["sent"] += 1
 
-        await asyncio.sleep(random.uniform(4, 9))  # пауза между фильтрами
+        await asyncio.sleep(random.uniform(4, 9))
 
     STATE["last_scan"] = time.time()
     db.cleanup()
     return summary
+
 
 
 async def maybe_alert_parser_down(platform: str, err: str):
@@ -136,17 +243,39 @@ async def maybe_alert_parser_down(platform: str, err: str):
 
 
 async def scanner_loop():
-    await asyncio.sleep(5)  # даём боту подняться
+    await asyncio.sleep(5)
+
     while True:
+        blocked_until, _ = db.get_scan_block()
+        now = int(time.time())
+
+        # Во время блокировки не запускаем даже пустые циклы сканирования.
+        if blocked_until > now:
+            await asyncio.sleep(min(blocked_until - now, 3600))
+            continue
+
         if not STATE["paused"]:
             try:
-                s = await scan_once()
-                log.info("Скан: %s лотов, новых %s, отправлено %s",
-                         s["scanned"], s["new"], s["sent"])
+                result = await scan_once()
+
+                if not result.get("blocked_until"):
+                    log.info(
+                        "Скан: %s лотов, новых %s, отправлено %s",
+                        result["scanned"],
+                        result["new"],
+                        result["sent"],
+                    )
+
             except Exception as e:
                 log.exception("Ошибка цикла сканирования: %s", e)
-        interval = max(5, int(CFG["settings"]["check_interval_minutes"])) * 60
+
+        interval = max(
+            5,
+            int(CFG["settings"]["check_interval_minutes"]),
+        ) * 60
+
         await asyncio.sleep(interval + random.uniform(0, 60))
+
 
 
 # ========================== УВЕДОМЛЕНИЯ ==========================
@@ -185,16 +314,60 @@ async def notify_deal(v):
     if not cid:
         log.warning("chat_id неизвестен — напиши боту /start")
         return
+
     text = deal_card(v)
-    try:
-        if v.listing.image:
-            await bot.send_photo(cid, v.listing.image, caption=text[:1024],
-                                 reply_markup=deal_keyboard(v))
-        else:
-            await bot.send_message(cid, text, reply_markup=deal_keyboard(v))
-    except Exception as e:
-        log.warning("Не смог отправить карточку: %s", e)
-        await bot.send_message(cid, text, reply_markup=deal_keyboard(v))
+
+    if v.listing.image:
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True,
+                headers={"Referer": "https://www.avito.ru/"}
+            ) as client:
+                response = await client.get(v.listing.image)
+                response.raise_for_status()
+
+                content_type = response.headers.get(
+                    "content-type", ""
+                ).split(";")[0].lower()
+
+                if not content_type.startswith("image/"):
+                    raise ValueError(
+                        f"Ссылка вернула не изображение: {content_type}"
+                    )
+
+                data = response.content
+
+                if len(data) > 9 * 1024 * 1024:
+                    raise ValueError("Изображение превышает 9 МБ")
+
+            extension = {
+                "image/jpeg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+            }.get(content_type, "jpg")
+
+            photo = BufferedInputFile(
+                data,
+                filename=f"avito.{extension}"
+            )
+
+            await bot.send_photo(
+                cid,
+                photo,
+                caption=text[:1024],
+                reply_markup=deal_keyboard(v)
+            )
+            return
+
+        except Exception as e:
+            log.warning("Не удалось скачать или отправить фото: %s", e)
+
+    await bot.send_message(
+        cid,
+        text,
+        reply_markup=deal_keyboard(v)
+    )
 
 
 # =========================== КОМАНДЫ ===========================
@@ -219,14 +392,37 @@ async def cmd_start(m: Message):
 async def cmd_status(m: Message):
     if not is_owner(m):
         return
-    last = (time.strftime("%H:%M:%S", time.localtime(STATE["last_scan"]))
-            if STATE["last_scan"] else "ещё не было")
-    errs = ", ".join(f"{p}: {n}" for p, n in STATE["errors"].items() if n) or "нет"
+
+    last = (
+        time.strftime("%H:%M:%S", time.localtime(STATE["last_scan"]))
+        if STATE["last_scan"]
+        else "ещё не было"
+    )
+
+    errs = (
+        ", ".join(f"{p}: {n}" for p, n in STATE["errors"].items() if n)
+        or "нет"
+    )
+
+    blocked_until, blocked_reason = db.get_scan_block()
+
+    if blocked_until > int(time.time()):
+        block_status = (
+            "⛔ Источник ограничен до: "
+            f"{time.strftime('%d.%m.%Y %H:%M:%S', time.gmtime(blocked_until))} UTC\n"
+            f"Причина: {html.escape(blocked_reason)}\n"
+        )
+    else:
+        block_status = "Ограничение источника: нет\n"
+
     await m.answer(
         f"📊 Статус: {'⏸ пауза' if STATE['paused'] else '▶️ работает'}\n"
         f"Последний скан: {last}\n"
         f"Интервал: {CFG['settings']['check_interval_minutes']} мин\n"
-        f"Ошибки парсеров: {errs}")
+        f"{block_status}"
+        f"Ошибки парсеров: {errs}"
+    )
+
 
 
 @dp.message(Command("filters"))
@@ -263,20 +459,59 @@ async def cmd_pause(m: Message):
 
 @dp.message(Command("resume"))
 async def cmd_resume(m: Message):
-    if is_owner(m):
+    if not is_owner(m):
+        return
+
+    blocked_until, _ = db.get_scan_block()
+
+    if blocked_until > int(time.time()):
+        await m.answer(
+            "⛔ Ручная пауза снята, но действует ограничение Авито.\n"
+            "Новые запросы не будут отправляться до окончания защитной паузы."
+        )
         STATE["paused"] = False
-        await m.answer("▶️ Сканер работает.")
+        return
+
+    STATE["paused"] = False
+    await m.answer("▶️ Сканер работает.")
+
 
 
 @dp.message(Command("test"))
 async def cmd_test(m: Message):
     if not is_owner(m):
         return
-    await m.answer("🔍 Сканирую вне очереди...")
-    s = await scan_once()
-    await m.answer(f"Готово: {s['scanned']} лотов, новых {s['new']}, "
-                   f"подходящих {s['sent']}.\n"
-                   + ("\n".join(s["errors"]) if s["errors"] else "Ошибок нет."))
+
+    blocked_until, blocked_reason = db.get_scan_block()
+
+    if blocked_until > int(time.time()):
+        await m.answer(
+            "⛔ Тестовый запуск запрещён защитой.\n"
+            f"Ограничение действует до "
+            f"{time.strftime('%d.%m.%Y %H:%M:%S', time.gmtime(blocked_until))} UTC.\n"
+            f"Причина: {html.escape(blocked_reason)}"
+        )
+        return
+
+    await m.answer("🔍 Сканирую...")
+    result = await scan_once()
+
+    if result.get("blocked_until"):
+        await m.answer(
+            "⛔ Авито ограничило доступ. Все дальнейшие запросы остановлены."
+        )
+        return
+
+    await m.answer(
+        f"Готово: {result['scanned']} лотов, новых {result['new']}, "
+        f"подходящих {result['sent']}.\n"
+        + (
+            "\n".join(result["errors"])
+            if result["errors"]
+            else "Ошибок нет."
+        )
+    )
+
 
 
 @dp.callback_query(F.data.startswith(("take:", "skip:")))
